@@ -1,20 +1,12 @@
 use std::error::Error;
-use std::fs::File;
 use std::io::{Read};
-use std::path::Path;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use csv;
 use plotters::prelude::*;
 use chrono::{DateTime, Utc, TimeZone};
-extern crate plotters;
-use plotters::prelude::*;
-use ndarray::Array1;
-use plotters::evcxr::SVGWrapper;
-use plotters::style::colors::full_palette;
-use ndarray::{Array2, ArrayBase, OwnedRepr, Dim};
-
-
+use ndarray::{Array2, s};
+use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::Uniform;
 
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,23 +72,20 @@ fn CleanRecord(r:DirtyKline) -> CleanKline {
     c
 }
 
-fn processed_csv_file(path: &str) -> Array2<f32> {
-    let mut file =  File::open(path).expect("Failed to open CSV file");
-    let mut content = String::new();
-    file.read_to_string(&mut content).expect("Failed to read CSV file");
-    let first_line = content.lines().next().unwrap();
-    let headers: Vec<&str> = first_line.split(',').collect();
-    let mut v: Vec<DirtyKline> = Vec::new();
-
+fn processed_csv_file(path: &str) -> Vec<CleanKline> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
-        .from_path("klines.csv")
+        .from_path(path)
         .expect("Failed to create CSV reader");
-    for result in rdr.deserialize::<DirtyKline> () {
+    
+    let mut clean_klines = Vec::new();
+    
+    for result in rdr.deserialize::<DirtyKline>() {
         match result {
-            Ok(result) => {
-                v.push(result);
+            Ok(dirty_record) => {
+                let clean_record = CleanRecord(dirty_record);
+                clean_klines.push(clean_record);
             },
             Err(err) => {
                 println!("Error reading record: {}", err);
@@ -104,14 +93,9 @@ fn processed_csv_file(path: &str) -> Array2<f32> {
             }
         }
     }
-    let mut clean_klines: Array2<CleanKline> = Vec::new();
-    for record in v{
-        let clean_record: CleanKline = CleanRecord(record);
-        clean_klines.push(clean_record);
-    }
+    
     clean_klines
 }
-
 
 struct NeuralNetwork {
     inputs_size: usize,
@@ -156,7 +140,7 @@ impl NeuralNetwork {
         input.mapv(|x| 1.0/(1.0 + (-x).exp()))
     }
 
-    fn sigmoid_derivative(input: &Array2<f32>) -> Aray2<f32> {
+    fn sigmoid_derivative(input: &Array2<f32>) -> Array2<f32> {
         input.mapv(|x| x* (1.0-x))
     }
 
@@ -175,49 +159,248 @@ impl NeuralNetwork {
     }
 
     fn backward(&mut self, inputs: &Array2<f32>, hidden1_out: &Array2<f32>, hidden2_out: &Array2<f32>, hidden3_out: &Array2<f32>, hidden4_out: &Array2<f32>, output_out: &Array2<f32>, target: &Array2<f32>) {
-        //calculate and propagate the error from last layer to first layer
+        // Calculate errors for each layer
         let output_error = target - output_out;
         let output_delta = output_error * NeuralNetwork::sigmoid_derivative(output_out);
-        let hidden4_error = output_delta.dot(self.weights_layer4_to_output.t());
+        
+        // Calculate hidden layer errors
+        let weights_4_to_output_t = self.weights_layer4_to_output.t();
+        let hidden4_error = output_delta.dot(&weights_4_to_output_t);
         let hidden4_delta = hidden4_error * NeuralNetwork::sigmoid_derivative(hidden4_out);
-        let hidden3_error = hidden4_delta.dot(self.weights_layer3_to_layer4.t());
+        
+        let weights_3_to_4_t = self.weights_layer3_to_layer4.t();
+        let hidden3_error = hidden4_delta.dot(&weights_3_to_4_t);
         let hidden3_delta = hidden3_error * NeuralNetwork::sigmoid_derivative(hidden3_out);
-        let hidden2_error = hidden3_delta.dot(self.weights_layer2_to_layer3.t());
+        
+        let weights_2_to_3_t = self.weights_layer2_to_layer3.t();
+        let hidden2_error = hidden3_delta.dot(&weights_2_to_3_t);
         let hidden2_delta = hidden2_error * NeuralNetwork::sigmoid_derivative(hidden2_out);
-        let hidden1_error = hidden2_delta.dot(self.weights_layer1_to_layer2.t());
+        
+        let weights_1_to_2_t = self.weights_layer1_to_layer2.t();
+        let hidden1_error = hidden2_delta.dot(&weights_1_to_2_t);
         let hidden1_delta = hidden1_error * NeuralNetwork::sigmoid_derivative(hidden1_out);
-        //new_weights = old_weights + learning_rate * (activations_from_previous_layer.transpose() * delta_of_current_layer)
-        self.weights_input_to_layer1 += inputs.t().dot(&hidden1_delta) * self.learning_rate;
-        self.weights_layer1_to_layer2 += hidden1_out.t().dot(&hidden2_delta).mapv(|x| x * self.learning_rate);
-        self.weights_layer2_to_layer3 += hidden2_out.t().dot(&hidden3_delta).mapv(|x| x * self.learning_rate);
-        self.weights_layer3_to_layer4 += hidden3_out.t().dot(&hidden4_delta).mapv(|x| x * self.learning_rate);
-        self.weights_layer4_to_output += hidden4_out.t().dot(&output_delta).mapv(|x| x * self.learning_rate);
+        
+        // Update weights
+        let inputs_t = inputs.t();
+        let delta_w_input_to_1 = inputs_t.dot(&hidden1_delta) * self.learning_rate;
+        self.weights_input_to_layer1 += &delta_w_input_to_1;
+        
+        let hidden1_t = hidden1_out.t();
+        let delta_w_1_to_2 = hidden1_t.dot(&hidden2_delta) * self.learning_rate;
+        self.weights_layer1_to_layer2 += &delta_w_1_to_2;
+        
+        let hidden2_t = hidden2_out.t();
+        let delta_w_2_to_3 = hidden2_t.dot(&hidden3_delta) * self.learning_rate;
+        self.weights_layer2_to_layer3 += &delta_w_2_to_3;
+        
+        let hidden3_t = hidden3_out.t();
+        let delta_w_3_to_4 = hidden3_t.dot(&hidden4_delta) * self.learning_rate;
+        self.weights_layer3_to_layer4 += &delta_w_3_to_4;
+        
+        let hidden4_t = hidden4_out.t();
+        let delta_w_4_to_output = hidden4_t.dot(&output_delta) * self.learning_rate;
+        self.weights_layer4_to_output += &delta_w_4_to_output;
     }
 
-
-    fn train(&mut self, input: &Array2<f32>, target: &Array2<f32>, epochs: usize) {
-        let n = input.nrows();
-        let mut correct = 0;
-        for epoch in 0..epochs {
-            let (hidden1_out, hidden2_out, hidden3_out, hidden4_out, output_out) = self.forward(input);
-            for i in 0..=n {
-
+    fn prepare_data(&self, data: &Vec<CleanKline>, window_size: usize, test_ratio: f32) -> (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>) {
+        let max_open = data.iter().map(|x| x.open).fold(0.0, f64::max);
+        let max_high = data.iter().map(|x| x.high).fold(0.0, f64::max);
+        let max_low = data.iter().map(|x| x.low).fold(0.0, f64::max);
+        let max_close = data.iter().map(|x| x.close).fold(0.0, f64::max);
+        let max_column = data.iter().map(|x| x.volume).fold(0.0, f64::max);
+        let mut feature = Vec::new();
+        let mut targets = Vec::new();  // Renamed from target to targets
+        for i in window_size..data.len() {
+            let mut window_features = Vec::new();
+            for j in i-window_size..i {
+                window_features.push((data[j].open / max_open) as f32);
+                window_features.push((data[j].high / max_high) as f32);
+                window_features.push((data[j].low / max_low) as f32);
+                window_features.push((data[j].close / max_close) as f32);
+                window_features.push((data[j].volume / max_column) as f32);
             }
-            
-            
+            feature.push(window_features);
+            // Removed let mut target = Vec::new(); to avoid shadowing
+            targets.push(vec![(data[i].close / max_close) as f32]);
+        }
+        //determine the test train split point
+        let total_samples = feature.len();
+        let test_samples = (total_samples as f32 * test_ratio) as usize;
+        let train_samples = (total_samples as f32 * (1.0 - test_ratio)) as usize;
+        let train_features: Vec<Vec<f32>> = feature[0..train_samples].to_vec();
+        let train_targets: Vec<Vec<f32>> = targets[0..train_samples].to_vec();  // Changed target to targets
+        let test_features: Vec<Vec<f32>> = feature[train_samples..total_samples].to_vec();
+        let test_targets: Vec<Vec<f32>> = targets[train_samples..total_samples].to_vec();  // Changed target to targets
+        //convert to ndarray
+        let x_train = Array2::from_shape_vec(
+            (train_features.len(), train_features[0].len()),
+            train_features.into_iter().flatten().collect()
+        ).expect("Failed to create train features array");
+        
+        let y_train = Array2::from_shape_vec(
+            (train_targets.len(), train_targets[0].len()),
+            train_targets.into_iter().flatten().collect()
+        ).expect("Failed to create train targets array");
+        
+        let x_test = Array2::from_shape_vec(
+            (test_features.len(), test_features[0].len()),
+            test_features.into_iter().flatten().collect()
+        ).expect("Failed to create test features array");
+        
+        let y_test = Array2::from_shape_vec(
+            (test_targets.len(), test_targets[0].len()),
+            test_targets.into_iter().flatten().collect()
+        ).expect("Failed to create test targets array");
+        
+        (x_train, y_train, x_test, y_test)
+    }
+
+    fn train(&mut self, x_train: &Array2<f32>, y_train: &Array2<f32>, epochs: usize) {
+        for epoch in 0..epochs {
+            let (hidden1_out, hidden2_out, hidden3_out, hidden4_out, output_out) = self.forward(x_train);
+            self.backward(x_train, &hidden1_out, &hidden2_out, &hidden3_out, &hidden4_out, &output_out, y_train);
+            println!("Epoch {} completed", epoch);
         }
     }
 
-    fn normalize_data(&self, data: &Array2<f32>) -> Array2<f32> {
-        let max_price = data.iter().map(|x| x.close).fold(0.0, f64::max);
-        let max_column = data.iter().map(|x| x.volume).fold(0.0, f64::max);
-        let mut x_feature = Vec::new();
-        let mut y_target= Vec::new();
+    fn visualize_predictions(
+        data: &Vec<CleanKline>, 
+        predictions: &Vec<f32>, 
+        actual: &Vec<f32>, 
+        window_size: usize,
+        test_ratio: f32
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Calculate the starting index for test data
+        let total_samples = data.len() - window_size;
+        let train_samples = (total_samples as f32 * (1.0 - test_ratio)) as usize;
+        let test_start_idx = window_size + train_samples;
         
+        // Create dates for x-axis
+        let dates: Vec<DateTime<Utc>> = data[test_start_idx..test_start_idx + predictions.len()]
+            .iter()
+            .map(|k| k.open_time)
+            .collect();
+        
+        // Create the plot
+        let root = BitMapBackend::new("price_prediction.png", (1200, 800)).into_drawing_area();
+        root.fill(&WHITE)?;
+        
+        // Find min and max for scaling
+        let min_price = actual.iter()
+            .zip(predictions.iter())
+            .map(|(a, p)| a.min(*p))
+            .fold(f32::INFINITY, |min_val, x| min_val.min(x));
+        
+        let max_price = actual.iter()
+            .zip(predictions.iter())
+            .map(|(a, p)| a.max(*p))
+            .fold(f32::NEG_INFINITY, |max_val, x| max_val.max(x));
+        
+        // Add margin
+        let price_range = max_price - min_price;
+        let y_min = min_price - 0.1 * price_range;
+        let y_max = max_price + 0.1 * price_range;
+        
+        // Create the chart
+        let mut chart = ChartBuilder::on(&root)
+            .caption("BTC Price Prediction", ("sans-serif", 40).into_font())
+            .margin(10)
+            .x_label_area_size(50)
+            .y_label_area_size(60)
+            .build_cartesian_2d(
+                dates[0]..dates[dates.len()-1],
+                y_min..y_max
+            )?;
+        
+        // Configure grid
+        chart.configure_mesh()
+            .y_desc("Price (Normalized)")
+            .x_desc("Date")
+            .draw()?;
+        
+        // Draw actual prices
+        chart.draw_series(LineSeries::new(
+            dates.iter().zip(actual.iter()).map(|(d, p)| (*d, *p)),
+            &BLUE,
+        ))?
+        .label("Actual Price")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+        
+        // Draw predicted prices
+        chart.draw_series(LineSeries::new(
+            dates.iter().zip(predictions.iter()).map(|(d, p)| (*d, *p)),
+            &RED,
+        ))?
+        .label("Predicted Price")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+        
+        // Draw legend
+        chart.configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .draw()?;
+        
+        println!("Visualization saved as 'price_prediction.png'");
+        Ok(())
+    }
 
+    //test the model trained and reported the error (mean squared error)
+    fn test(&self, x_test: &Array2<f32>, y_test: &Array2<f32>) -> f32 {
+        let (_, _, _, _, predicted_output) = self.forward(x_test);
+        let mut total_error = 0.0;
+        
+        for i in 0..x_test.nrows() {
+            let pred_i = predicted_output.slice(s![i, ..]);
+            let target_i = y_test.slice(s![i, ..]);
+            let diff = &pred_i - &target_i;
+            let squared_error = diff.mapv(|x| x.powi(2)).sum();
+            total_error += squared_error;
+        }
+        total_error / (x_test.nrows() as f32)
+    }
 
 }
 
 fn main() {
     let cleankline = processed_csv_file("klines.csv");
+    let window_size = 70;
+    let test_ratio = 0.2;
+    
+    println!("Loaded {} data points", cleankline.len());
+    
+    let mut nn = NeuralNetwork::new(
+        350,
+        175,
+        80,
+        50,
+        40,
+        1, //representing the closing price for our prediction
+        0.01
+    );
+    
+    println!("Preparing data...");
+    let (x_train, y_train, x_test, y_test) = nn.prepare_data(&cleankline, window_size, test_ratio);
+    println!("Training with {} samples, testing with {} samples", x_train.nrows(), x_test.nrows());
+    
+    println!("Training the neural network...");
+    nn.train(&x_train, &y_train, 1000);
+    
+    let mse = nn.test(&x_test, &y_test);
+    println!("Test MSE: {:.6}", mse);
+    
+    // Get predictions and targets for visualization
+    let (_, _, _, _, predictions) = nn.forward(&x_test);
+    
+    // Convert to Vec<f32> for visualization
+    let pred_vec: Vec<f32> = predictions.column(0).to_vec();
+    let actual_vec: Vec<f32> = y_test.column(0).to_vec();
+    
+    // Visualize
+    match NeuralNetwork::visualize_predictions(&cleankline, &pred_vec, &actual_vec, window_size, test_ratio) {
+        Ok(_) => println!("Successfully created visualization!"),
+        Err(e) => println!("Error creating visualization: {}", e),
+    }
+
 }
+
+
